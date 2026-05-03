@@ -6,6 +6,7 @@ import 'package:sqflite/sqflite.dart';
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 import 'package:dio/dio.dart';
+import 'package:archive/archive.dart';
 
 // --- CONFIGURATION ---
 // Replace this with your GitHub RAW URL once you upload the fonts folder
@@ -45,7 +46,7 @@ class _QuranHomePageState extends State<QuranHomePage> {
   Map<String, String>? _glyphs;
   bool _isLoading = true;
   final Set<String> _loadedFonts = {};
-  final Map<int, bool> _downloadingFonts = {};
+  bool _isExtractingFonts = false;
 
   @override
   void initState() {
@@ -65,13 +66,38 @@ class _QuranHomePageState extends State<QuranHomePage> {
     }
     _db = await openDatabase(dbPath);
 
-    // 2. Load Glyphs JSON (Keep local or download)
+    // 2. Load Glyphs JSON
     String jsonString = await rootBundle.loadString('assets/data/qpc-v4.json');
     Map<String, dynamic> rawGlyphs = json.decode(jsonString);
     _glyphs = {};
     rawGlyphs.forEach((key, value) {
       _glyphs![value['id'].toString()] = value['text'];
     });
+
+    // 3. Extract Fonts ZIP if needed
+    String fontsDir = p.join(docsDir.path, "fonts");
+    if (!await Directory(fontsDir).exists() || (await Directory(fontsDir).list().length) < 600) {
+      setState(() => _isExtractingFonts = true);
+      try {
+        await Directory(fontsDir).create(recursive: true);
+        ByteData data = await rootBundle.load("assets/fonts.zip");
+        List<int> bytes = data.buffer.asUint8List(data.offsetInBytes, data.lengthInBytes);
+        
+        Archive archive = ZipDecoder().decodeBytes(bytes);
+        for (ArchiveFile file in archive) {
+          String filename = file.name;
+          if (file.isFile) {
+            List<int> data = file.content as List<int>;
+            File(p.join(fontsDir, filename))
+              ..createSync(recursive: true)
+              ..writeAsBytesSync(data);
+          }
+        }
+      } catch (e) {
+        debugPrint("Extraction error: $e");
+      }
+      setState(() => _isExtractingFonts = false);
+    }
 
     setState(() {
       _isLoading = false;
@@ -80,24 +106,15 @@ class _QuranHomePageState extends State<QuranHomePage> {
 
   Future<void> _loadFontIfNeeded(int pageNumber) async {
     String fontFamily = 'p$pageNumber';
-    if (_loadedFonts.contains(fontFamily) || _downloadingFonts[pageNumber] == true) return;
+    if (_loadedFonts.contains(fontFamily) || _isExtractingFonts) return;
 
     Directory docsDir = await getApplicationDocumentsDirectory();
     String fontPath = p.join(docsDir.path, "fonts", "p$pageNumber.ttf");
     File fontFile = File(fontPath);
 
     if (!await fontFile.exists()) {
-      // Download from Cloud
-      setState(() => _downloadingFonts[pageNumber] = true);
-      try {
-        await Directory(p.dirname(fontPath)).create(recursive: true);
-        String url = "$kBaseFontsUrl/p$pageNumber.ttf";
-        await Dio().download(url, fontPath);
-      } catch (e) {
-        debugPrint("Download failed for p$pageNumber: $e");
-        setState(() => _downloadingFonts[pageNumber] = false);
-        return;
-      }
+      debugPrint("Font file not found: $fontPath");
+      return;
     }
 
     // Load into Flutter memory
@@ -108,7 +125,6 @@ class _QuranHomePageState extends State<QuranHomePage> {
       await fontLoader.load();
       
       _loadedFonts.add(fontFamily);
-      _downloadingFonts[pageNumber] = false;
       if (mounted) setState(() {}); 
     } catch (e) {
       debugPrint("Font loading error: $e");
@@ -140,7 +156,7 @@ class _QuranHomePageState extends State<QuranHomePage> {
             db: _db!,
             glyphs: _glyphs!,
             isFontLoaded: _loadedFonts.contains('p$pageNum'),
-            isDownloading: _downloadingFonts[pageNum] ?? false,
+            isExtracting: _isExtractingFonts,
           );
         },
       ),
@@ -153,7 +169,7 @@ class QuranPage extends StatelessWidget {
   final Database db;
   final Map<String, String> glyphs;
   final bool isFontLoaded;
-  final bool isDownloading;
+  final bool isExtracting;
 
   const QuranPage({
     super.key,
@@ -161,7 +177,7 @@ class QuranPage extends StatelessWidget {
     required this.db,
     required this.glyphs,
     required this.isFontLoaded,
-    required this.isDownloading,
+    required this.isExtracting,
   });
 
   Future<List<Map<String, dynamic>>> _getPageData() async {
@@ -175,21 +191,21 @@ class QuranPage extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    if (isDownloading) {
+    if (isExtracting) {
       return Center(
         child: Column(
           mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            const CircularProgressIndicator(),
-            const SizedBox(height: 10),
-            Text("جاري تحميل خط الصفحة $pageNumber..."),
+          children: const [
+            CircularProgressIndicator(),
+            SizedBox(height: 10),
+            Text("جاري استخراج الخطوط (لأول مرة فقط)..."),
           ],
         ),
       );
     }
 
     if (!isFontLoaded) {
-      return const Center(child: Text("في انتظار تحميل الخط..."));
+      return const Center(child: Text("جاري تحميل الخط..."));
     }
 
     return FutureBuilder<List<Map<String, dynamic>>>(
